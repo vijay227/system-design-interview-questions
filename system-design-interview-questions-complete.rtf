@@ -1,0 +1,694 @@
+{\rtf1\ansi\deff0{\fonttbl{\f0 Arial;}}\viewkind4\uc1\pard\f0\fs24\par
+Let’s be honest about the classic system design questions. “Design Twitter.” “Build YouTube.” “Scale Stripe.” You’ve never worked on those systems. Neither has the person interviewing you. And unless you’re at one of maybe fifteen companies on earth, you never will.\par
+\par
+System design prep has become its own cottage industry. Everyone knows the moves by now: add a load balancer, sprinkle in some caching, say the words “eventual consistency,” nod confidently. Companies figured this out. The script stopped working.\par
+\par
+**Medium paywall got you? This [link](https://medium.com/@TheAbstractEngineer/667c85cf32b1?sk=b251e9942ff3c3bbd1cf8e3cadce6574) lets you read it free.**\par
+\par
+What I keep hearing from friends interviewing lately, particularly in Karat screens and senior loops, is that the questions have shifted toward problems the team is actually fighting with that quarter. Things like:\par
+\par
+- How would you make YouTube better at catching copyrighted uploads?\par
+- How do you keep millions of devices in sync when most of them are offline most of the time?\par
+- How do you push notifications to 100 million users without turning into spam?\par
+\par
+None of these draw nicely on a whiteboard. They’re messy. They come down to trade-offs, judgment calls, and accepting that no design is correct, only appropriate for the constraints you have right now.\par
+\par
+So I wrote up 50 of them. Real scenarios, the kind where you have to reason like someone shipping to production on Thursday instead of a student taking a test.\par
+\par
+This is Part 1, covering the first ten. Answers are short and practical, closer to what you’d actually say in the room.\par
+\par
+## Q1. Offline-first mobile sync\par
+\par
+**Your mobile app has to work with no connection and sync up later. How do you design the sync mechanism and handle conflicts?**\par
+\par
+Start with local storage that the app treats as the source of truth. Room on Android, Core Data on iOS, or plain SQLite. Every user action writes locally first and gets appended to a queue (WorkManager, or an RxJava queue if that’s your stack). The UI never waits on the network, which is the whole point.\par
+\par
+When the connection comes back, flush the queue in batches, ordered by timestamp. The hard part is what happens when the same record got edited on two devices while both were dark. Your options, roughly in order of effort:\par
+\par
+- Last write wins, based on timestamp. Cheap, and fine for things like a settings toggle.\par
+- Prompt the user to merge. Annoying, but sometimes the only honest answer for documents or notes.\par
+- CRDTs or version vectors. Real work, but they let you merge automatically without lying to the user about what happened.\par
+\par
+Pick based on how much the data actually matters. Losing someone’s collaborative doc edits is a very different failure than losing a “dark mode: on” toggle.\par
+\par
+Two things that will bite you if you skip them. First, make every sync operation idempotent, because retries are guaranteed and duplicate writes are ugly. Second, use a sync cursor or token so the client pulls only the delta instead of re-downloading the world every time it reconnects. Add exponential backoff on retries so a flapping connection doesn’t hammer your API.\par
+\par
+**Short version:** write locally, sync in batches, and be deliberate about conflicts instead of hoping they don’t happen.\par
+\par
+## Q2. Push notifications at scale\par
+\par
+**Design a system that sends push notifications to millions of users in real time, like a breaking news alert.**\par
+\par
+You don’t talk to devices. APNs handles iOS, FCM handles Android, and your job is managing device tokens and living inside their constraints: payload size caps, rate limits, token expiry, and cleaning up tokens that come back invalid.\par
+\par
+Fan-out is where this gets interesting. Ten million sends can’t come from one box. Put the send job on a queue and let a pool of workers chew through it in parallel, partitioned by token or user ID. Scale the worker pool, not the single sender.\par
+\par
+Delivery is not guaranteed and you should design like you believe that. Devices are off, out of coverage, or the OS decided to throttle. Retry a few times, then stop. If a phone hasn’t checked in for four days, that breaking news alert is no longer breaking, and delivering it is arguably worse than dropping it.\par
+\par
+Then there’s the part people forget in interviews: the human on the other end. Honor opt-outs, quiet hours, and per-category preferences. Coalesce related alerts instead of firing five in a row. A notification system that technically works but gets your app muted has failed at its actual job.\par
+\par
+## Q3. Real-time location tracking for ride-hailing\par
+\par
+**You’re building the location layer for something like Uber. How do you get GPS updates to driver and rider apps efficiently?**\par
+\par
+Use a persistent connection. WebSockets or MQTT, with MQTT being the better fit if you care about battery and small payloads. Polling every second for a moving car is wasteful in both directions.\par
+\par
+The update frequency is a real trade-off and interviewers usually want to hear you name it. One update per second looks great on the map and eats battery. Every three to five seconds is usually plenty, and you can do better by only sending when the driver has moved past some distance threshold. A car sitting at a red light doesn’t need to report anything.\par
+\par
+On the backend, partition by geography or by trip so each server owns a slice of active rides. Model it as pub/sub: the rider subscribes to their driver’s channel, and location updates go only to subscribers. Nobody broadcasts to everybody.\par
+\par
+Then handle the ugly reality of GPS. Signal drops in tunnels and parking garages. Coordinates jump around near tall buildings. The client can smooth this by interpolating along the last known heading for a few seconds, then showing “signal lost” if nothing arrives. And when a client reconnects, send it the current position immediately rather than making it wait for the next scheduled update.\par
+\par
+## Q4. Uploads that survive bad networks\par
+\par
+**Your app uploads photos and videos. In regions with weak connectivity, uploads keep failing. How do you fix the experience?**\par
+\par
+Chunk the file and upload the pieces. When the connection dies at 80%, you retry one chunk, not 40 megabytes. Every major storage API supports resumable multipart uploads, so you rarely have to build this from scratch.\par
+\par
+Run the upload in a background service so it survives the user switching apps or locking the phone. That service watches connectivity and pauses and resumes on its own. Nobody should have to sit staring at a progress bar to keep their vacation photos from disappearing.\par
+\par
+Compress on-device before sending. Resizing a 12 megapixel photo down to something reasonable can cut the payload by an order of magnitude, and most users won’t see the difference. If your app is photography-focused, make it a setting instead of a decision you make for them: “upload full quality on Wi-Fi only” covers most cases.\par
+\par
+Finally, be honest in the UI. Show real progress. When something fails, say so and give a retry button. If the network is hopeless, queue the upload and tell the user it’ll go out later. Silent failure is the worst possible outcome here, because people assume the photo uploaded and delete it from their camera roll.\par
+\par
+## Q5. Supporting old app versions\par
+\par
+**Your API keeps evolving but plenty of users are still on a build from eight months ago. How do you handle it?**\par
+\par
+The straightforward path is versioned endpoints: /api/v1/..., /api/v2/.... Old clients keep hitting the old routes and nothing breaks. The cost is that you now maintain two code paths, and if you're not disciplined, four.\par
+\par
+The alternative is a compatibility layer at the edge. Read the client version from a header, then shape the response to match what that build expects. New field the old app can’t parse? Strip it or supply a default. This keeps one core codebase but pushes the mess into a translation layer, which has its own way of getting gnarly.\par
+\par
+Either way you need a deprecation policy. Support the last N versions, warn people well before you cut them off, and force the upgrade eventually. Too aggressive and you’re breaking people mid-flight. Too lenient and you’re maintaining code for a build from 2023 that nine people still use.\par
+\par
+And test it. Keep a suite that runs your new backend against payloads from older clients. This is boring work that saves you from a very bad Monday.\par
+\par
+## Q6. When the backend goes down\par
+\par
+**Your backend is temporarily unavailable. What should the app do?**\par
+\par
+Show something. Cache recent data locally (last viewed items, recent messages, the user’s own profile) and serve it with a small banner noting it might be stale. A slightly old screen beats a spinner or a red error page by a wide margin.\par
+\par
+Queue what you can. Let people compose the message, fill out the form, write the review. Store it locally and send it when the server comes back. You’re preserving their work and their momentum instead of throwing it away.\par
+\par
+Say what’s happening in plain language. “Can’t reach the server right now. Some things won’t work.” That’s better than “Error 503” and infinitely better than a screen that just sits there. If they try something that genuinely can’t be queued, tell them why.\par
+\par
+For the features that really can’t go down, consider a fallback. A static config file, a read replica, a cached response served from a CDN. It’s extra machinery and you shouldn’t build it for everything, but for login or a payment status check it can be worth it.\par
+\par
+## Q7. On-device versus cloud processing\par
+\par
+**A feature needs heavy computation, say image recognition or AR. Where does the work happen?**\par
+\par
+On-device wins on latency and availability. No round trip, no dependency on signal, and the data never leaves the phone, which matters a lot if you’re processing faces or documents. The costs are battery drain, a floor on what hardware you can support, and shipping model weights inside your app bundle.\par
+\par
+Server-side wins on capability. You can run a model that would never fit on a phone, upgrade it whenever you want, and keep hardware requirements out of your minimum spec. The costs are network dependency and a per-request compute bill that scales with usage.\par
+\par
+In practice most teams end up somewhere in the middle. Run a small model on-device to filter, crop, or detect that something is even worth processing, then send the reduced payload up for the expensive part. You cut both bandwidth and cloud spend, and the app still feels instant because the first stage is local.\par
+\par
+One factor that quietly decides this for a lot of teams: how often the logic changes. If you’re retraining monthly, server-side means you ship an update and everyone has it. On-device means waiting for app store review, or building a whole model-download-and-swap pipeline. That pipeline is more work than people expect.\par
+\par
+## Q8. Too many network calls\par
+\par
+**Users say the app feels slow, and you find it’s firing off a pile of small requests. What now?**\par
+\par
+Batch. If launching the app triggers five separate calls, build one endpoint that returns all of it. You’re paying for connection setup, TLS handshake, and round-trip latency five times over for no reason. On a 3G connection that’s the difference between 400ms and two seconds.\par
+\par
+Cache aggressively on the client. Config, feature flags, user preferences, category lists. Store them locally and only re-fetch when a version or timestamp says they changed. Most apps re-download the same unchanging JSON on every cold start.\par
+\par
+Prefetch when it’s cheap. After loading a list, pull details for the first few items in the background so tapping through feels instant. Just don’t get greedy and download things nobody looks at, especially on metered connections.\par
+\par
+If the slowness comes from constant back-and-forth rather than a few big calls, the protocol might be the problem. WebSockets or gRPC streams let you push small updates without HTTP overhead on every message. Worth it for chat, live scores, order tracking, anything where updates arrive continuously.\par
+\par
+## Q9. Monolith or microservices\par
+\par
+**New product, small team, scope still fuzzy. One engineer wants microservices on day one. What do you say?**\par
+\par
+Start with the monolith, and be able to explain why without sounding lazy.\par
+\par
+One codebase, one deploy, one place to look when something breaks. Refactoring across module boundaries is a find-and-replace instead of a coordination problem across three repos and two teams. With a small team and requirements that will change three times before launch, that speed is the whole advantage.\par
+\par
+Microservices are genuinely good at what they’re good at: scaling pieces independently, letting teams deploy on their own schedule, isolating failures. But you pay for it up front with service discovery, distributed tracing, network failure handling, versioned contracts between services, and a much harder local dev setup. Splitting a system you don’t understand yet means drawing boundaries in the wrong places, and moving a boundary later is far more painful than moving a module.\par
+\par
+The pragmatic answer is a well-structured monolith with clear internal module boundaries, then extract services when something actually demands it. Usually that’s a component with a wildly different scaling profile, like video transcoding or a search index, or a team that’s grown big enough to need its own deploy cadence. Let the pain tell you where to cut.\par
+\par
+## Q10. Rate limiting a public API\par
+\par
+**You’ve got a public REST API and some clients are hammering it. How do you design rate limiting?**\par
+\par
+Decide the policy first, since the implementation follows from it. Something like 100 requests per minute per API key, with different tiers for free and paid. Key off the API key rather than IP where you can, since IP breaks badly behind corporate NATs and mobile carriers.\par
+\par
+Enforce it at the gateway, before requests reach your application code. Token bucket is the usual choice: each request takes a token, tokens refill at a fixed rate, and an empty bucket means a 429. Bucket size controls how much burst you tolerate, which matters more than people think. A client that fires 20 requests on app launch and then goes quiet isn’t abusing anything, and a bucket with zero headroom punishes them for normal behavior.\par
+\par
+Counters have to be shared across servers. Redis is the standard answer here. If each instance keeps its own count, a client behind a load balancer effectively gets N times the limit, and your rate limiter is decoration.\par
+\par
+Last, make it usable. Document the limits. Return X-RateLimit-Remaining and X-RateLimit-Reset headers so clients can back off on their own instead of guessing. Send a Retry-After on the 429. Developers will build against your limits if you tell them what the limits are, and most abuse turns out to be a badly written retry loop rather than malice.\par
+\par
+## Q11. Designing a real-time chat backend\par
+\par
+**Build the backend for something like WhatsApp or Slack. What are the pieces, and where are the trade-offs?**\par
+\par
+Persistent connections, obviously. Each client holds a WebSocket so the server can push a message the moment it arrives instead of waiting for the next poll. That part isn’t interesting. The interesting parts are ordering, delivery, and what happens when someone’s phone has been off for a week.\par
+\par
+**Ordering.** Client timestamps lie. Phones have wrong clocks, and messages arrive out of order over unreliable networks anyway. Assign a sequence number server-side, per conversation, and let clients sort on that. This gets harder if you shard conversations across servers, which is one reason sharding by conversation ID rather than by user is usually the right call.\par
+\par
+**Delivery.** Assume at-least-once. If you don’t get an ack, resend. That means duplicates, so every message carries a client-generated UUID and the receiving side drops anything it’s already seen. Exactly-once delivery over a network is a fantasy people waste a lot of time chasing.\par
+\par
+**Scaling.** Shard users or rooms across chat servers so no single box owns everything. Then you need a pub/sub layer (Redis pub/sub for smaller setups, Kafka or NATS when you outgrow it) so a message sent on server A reaches a subscriber connected to server C. The connection layer and the message routing layer are separate concerns and it helps to talk about them separately.\par
+\par
+**Offline and history.** Undelivered messages go to durable storage keyed by recipient. When the client reconnects, it sends its last known sequence number and you ship the delta. Don’t sync the full history by default. Pull the last 50 or 100 messages per conversation and page backward on demand, or you’ll spend a fortune on bandwidth so people can scroll to a conversation from 2019 they’ll never open.\par
+\par
+## Q12. Fan-out to millions\par
+\par
+**One event, like a celebrity posting or a system-wide alert, needs to notify everybody. How do you build that?**\par
+\par
+Nothing about this happens synchronously. The event goes on a queue, and a pool of consumers each takes a slice of the recipient list. That’s the whole shape of it. The details are where you earn your money.\par
+\par
+**Batch and throttle.** Every downstream provider has limits. SES, SendGrid, FCM, APNs, all of them will throttle you or flag you as a spam source if you open the floodgates. Send in batches, and rate-limit your own workers below the provider ceiling rather than discovering the ceiling by hitting it. Batching also amortizes connection cost, which matters more than you’d think at volume.\par
+\par
+**Prioritize.** Not all notifications are equal. A password reset and a “someone liked your photo” should not share a queue. Use separate queues by priority so a marketing blast can’t delay a security alert by 20 minutes. When the system is under load, the low-priority queue is what you let back up.\par
+\par
+**Handle failure visibly.** Retry transient errors with backoff. Send permanent failures (dead tokens, bounced addresses) to a dead-letter queue and actually process it, cleaning up bad tokens as you go. Then instrument the send rate and success rate, because notification failures are silent by nature. Nobody files a ticket saying “I did not receive a notification I didn’t know about.” You find out three weeks later when someone asks why engagement dropped.\par
+\par
+## Q13. Distributed job scheduler\par
+\par
+**Design something that runs background jobs on a schedule across a cluster: emails, reports, cleanup tasks.**\par
+\par
+You need one authoritative store for what’s scheduled and when it next runs. A database table works fine for most scales. Workers query for jobs whose next run time has passed and claim them.\par
+\par
+The claiming is the whole problem. Two workers grabbing the same job means two emails, two invoices, two charges. Two ways to handle it:\par
+\par
+- **Leader election.** One node wins a lease (etcd, ZooKeeper, or a Postgres advisory lock if you don’t want another dependency) and hands out work. Simple to reason about, single point of coordination.\par
+- **Partitioning.** Hash the job ID and assign each worker a range. No coordination needed at steady state, but rebalancing when a worker dies is its own puzzle.\par
+\par
+Either way, jobs must be idempotent. Clock skew, failovers, and expired leases will eventually cause double execution no matter how careful your coordination is. Design for it instead of pretending it won’t happen. A status column with a state machine (pending, running, done) plus a conditional update is usually enough.\par
+\par
+Two operational things people skip and regret. Monitoring: you need visibility into next run time, last outcome, and duration, because a scheduled job that quietly stops running is invisible until the backups you thought you had turn out not to exist. And time zones: store everything in UTC, convert only at display time. If users can schedule in local time, be very deliberate about what happens during a DST transition, since 2:30 a.m. either doesn’t exist or happens twice depending on the direction.\par
+\par
+## Q14. Log ingestion at high volume\par
+\par
+**Your service produces an enormous number of log events. Design collection, storage, and querying.**\par
+\par
+Log agents on each host ship to a central pipeline, usually Kafka. The important property is that your application never blocks on logging. Write to a local buffer, let the agent do the shipping, and if the pipeline is down the app keeps serving traffic.\par
+\par
+From Kafka, fan out to different consumers with different jobs. One indexes into Elasticsearch or OpenSearch for interactive search. Another writes raw events to object storage in Parquet for cheap long-term retention and analytics. These have completely different cost profiles and you shouldn’t force one system to do both.\par
+\par
+Partition indices by time, usually daily. This makes queries bounded, lets you roll old indices to cheaper storage, and makes deletion a matter of dropping an index instead of running a delete query across a billion documents.\par
+\par
+Now the part that actually gets asked: what happens when volume spikes past what you can process. Kafka absorbs a lot, which buys you time to scale consumers. But if the spike is sustained you need a policy decided ahead of time, not during the incident. Usually that means sampling or dropping debug and info logs while preserving warn and error, since a wave of debug logging is often a symptom of the incident rather than useful signal. Say this out loud in an interview. Being willing to lose data on purpose to keep the system up is a senior instinct.\par
+\par
+## Q15. Payment processing without double charges\par
+\par
+**Design payment handling for e-commerce that stays correct when things fail.**\par
+\par
+Everything hangs off the idempotency key. The client generates one per checkout attempt and sends it with the request. Your gateway and your own service both key on it, so a retried request returns the original result instead of charging again. Stripe and most modern gateways support this natively and you should use it rather than inventing your own.\par
+\par
+Break the flow into explicit steps: authorize, capture, update order, send receipt. Each step records its outcome durably before moving on. If you’re spread across services, coordinate with a saga: when the charge succeeds but the order write fails, you need a compensating action, whether that’s an automatic refund or flagging it for a human. Use a transactional outbox so the “I took money” event survives the process dying immediately after taking the money.\par
+\par
+Timeouts are the nastiest case. A charge request that times out tells you nothing. It may have succeeded. Never blind-retry it. Query the gateway for the transaction status using your idempotency key, or wait for the webhook, then decide. Getting this wrong is how you end up on Twitter.\par
+\par
+On the security side, keep card data out of your systems entirely. Use hosted fields or the gateway’s SDK so raw PANs never touch your servers, store a token and the last four digits, and make sure your logging can’t accidentally capture a card number in a request dump. Keep an audit trail of every state transition, because finance will ask you to reconcile daily totals and you’ll want a record more precise than “the gateway says so.”\par
+\par
+## Q16. Building search\par
+\par
+**Users need to search posts, documents, or products. How do you build it?**\par
+\par
+Elasticsearch or OpenSearch for most cases. Postgres full-text search is genuinely fine up to a surprisingly large point, and starting there saves you an entire piece of infrastructure. Know that answer too, because “we don’t need Elasticsearch yet” is sometimes the correct one.\par
+\par
+The index holds a denormalized snapshot: title, description, tags, whatever you filter and rank on. Keeping it in sync with the primary database is the hard part. Change data capture (Debezium reading the WAL, or an outbox table drained by a worker) beats dual writes, because dual writes fail halfway and leave you with an index that quietly disagrees with your database. Plan for a full reindex too. You will change your mapping and need to rebuild, so make that a routine operation rather than an emergency.\par
+\par
+Some staleness is fine. Search results being a few seconds behind is almost never a real problem, and pretending you need synchronous index updates makes writes slow for no benefit.\par
+\par
+At query time, search returns IDs and scores. Whether you hydrate from the index or from your primary database depends on how much you trust the index’s freshness for the fields you display. Prices and stock levels are worth reading from the source of truth.\par
+\par
+Relevance is where search projects live or die, and it’s iterative. Boost title matches over body matches. Handle typos with fuzzy matching. Add n-grams if partial matches matter for your domain. Then log what people search, what they click, and especially what returns nothing, because your zero-result queries are the clearest list of what your search is bad at.\par
+\par
+## Q17. Going multi-region\par
+\par
+**Global user base. How do you deploy for low latency everywhere?**\par
+\par
+Full stacks in each region, with GeoDNS or an anycast load balancer routing users to the nearest one. Straightforward until you get to data, which is the entire question.\par
+\par
+Three broad approaches:\par
+\par
+- **Home region per user.** Their data lives in one place, and they’re routed there. Clean consistency story, and it maps well onto data residency requirements like GDPR. Falls apart for genuinely global features like a shared feed or leaderboard.\par
+- **Global reads, single-region writes.** Read replicas everywhere, writes go to a primary. Reads are fast for everyone, writes cost a cross-region round trip. Good for read-heavy workloads, which is most of them.\par
+- **Multi-master.** Writes are fast everywhere and you pay for it in conflict resolution. Spanner or CockroachDB will handle this for you at a latency and dollar cost. Rolling your own conflict resolution is a project, not a design decision.\par
+\par
+The trade-off to name explicitly is that synchronous global replication means every write waits on the slowest region, and physics puts a floor on that. Most systems accept eventual consistency and design the UX around it: show the user their own write immediately from local state, let it propagate in the background.\par
+\par
+The upside of all this is failure isolation. Active-active means you shift traffic away from a dead region and absorb the load elsewhere, which requires each region to have headroom you’re paying for. Active-passive is cheaper and slower to recover. Whichever you pick, run the failover regularly, because an untested failover is a hypothesis, not a plan.\par
+\par
+## Q18. Spiky traffic without spiky bills\par
+\par
+**Traffic is heavy during the day, near zero at night, with occasional big surges. How do you avoid paying for peak capacity 24/7?**\par
+\par
+Autoscaling is the obvious answer, and the obvious answer is incomplete. Scale on the metric that reflects your actual bottleneck, which is often queue depth or request latency rather than CPU. And know that reactive scaling is slow: by the time you’ve noticed load, provisioned an instance, and passed health checks, you may be several minutes into the spike. Keep enough warm headroom to cover that gap.\par
+\par
+Serverless suits this shape of load well. Scales to zero, scales out fast, and you pay per invocation. The catch is cold starts, and the fact that per-request cost is higher, so a workload that’s spiky but has a high floor can end up more expensive than reserved instances. Run the math for your actual numbers instead of assuming.\par
+\par
+For spikes too sharp for any scaling to catch, put a queue in front. Accept the request, return a 202, process at a sustainable rate. Users wait a bit longer, and you don’t fall over. This only works if the operation can be async, but far more things can be async than people initially think.\par
+\par
+And when you know a spike is coming, scale up beforehand. A scheduled scaling rule ahead of a 5 p.m. campaign is much more reliable than hoping autoscaling keeps up. Reactive scaling and queues are your safety net for the surges nobody predicted.\par
+\par
+## Q19. Disaster recovery\par
+\par
+**Business-critical app with strict uptime requirements. What’s the DR plan?**\par
+\par
+Start with the two numbers, because everything else is downstream of them. RPO is how much data you can afford to lose. RTO is how long you can be down. A team that says “zero and zero” hasn’t priced it. Get real numbers from the business and design to them.\par
+\par
+Backups go to a different region, and continuous replication to a standby keeps RPO low. Test the restores. An untested backup is a folder of files you hope are useful. Restore drills catch the corrupted backup, the missing encryption key, and the eight-hour restore time you didn’t budget for.\par
+\par
+Then pick your standby posture. Hot standby means a second environment running now, taking traffic within minutes, costing real money continuously. Warm means scaled-down infrastructure you scale up on failover. Cold means restoring from backup, which is cheap and might take a full day. This is purely a cost-versus-RTO decision and there’s no clever answer.\par
+\par
+Automate the failover itself. Health checks, low DNS TTLs, and a runbook that ideally isn’t a human editing config under pressure. Make sure the app picks up new database endpoints without a rebuild.\par
+\par
+Finally, plan for partial failures, which are far more common than losing a region. One database, one availability zone, one dependency. Full regional failover is a big hammer, and reaching for it when only the cache layer is down usually makes things worse.\par
+\par
+## Q20. Managed services versus self-hosting\par
+\par
+**You need a datastore and a queue. RDS and SQS, or run Postgres and Kafka yourself?**\par
+\par
+Default to managed, and know exactly why you’d deviate.\par
+\par
+Managed services buy back the work nobody wants: patching, backups, failover, replication setup, version upgrades. For a team without a dedicated infrastructure person, that’s not a convenience, it’s the difference between shipping features and becoming a part-time DBA. You pay a premium and you accept some lock-in, especially with the more proprietary offerings.\par
+\par
+Self-hosting makes sense at scale, where the managed premium turns into a serious line item, or when you need configuration the managed version won’t expose. Running Kafka yourself is very doable if you have people who know Kafka. If you don’t, you’ll learn during your first partition leader election problem, at 3 a.m., in production.\par
+\par
+The honest path for most teams is managed first, migrate later if the economics change. Start on RDS, and if you eventually outgrow it, you’ll be migrating with real usage data and a much better sense of what you actually need. Just don’t pretend that migration is free. Moving a production database is a project with a planning doc and a rollback plan.\par
+\par
+The one thing worth checking early is whether the managed version has a limit you’ll hit. Message size caps, connection limits, missing extensions, throughput ceilings. Finding out about those after you’ve built on top is a much worse day than reading the limits page now.\par
+\par
+That’s twenty. Part 3 gets into caching strategy, cache invalidation, and the failure modes that show up when your cache and your database disagree.\par
+\par
+Q21. **Migrating On-Premise App to Cloud:** *Your company has a legacy on-premises application and wants to move to the cloud (AWS/Azure/GCP). How would you plan and execute this migration?*\par
+\par
+A:\par
+\par
+- **Assessment & Planning:** Start by auditing the current system, its components, dependencies, data sizes, performance needs. Identify what cloud services map to each component (e.g., on-prem database could move to a cloud DB or a VM, file storage to S3, etc.). Determine if any components cannot be easily moved due to compliance or tight coupling to on-prem resources; those need special handling or redesign.\par
+- **Phased Migration:** Avoid a big bang where everything moves at once if possible. Migrate in phases: for example, move stateless application servers first (point them to still-on-prem database via VPN), then move the database in a later phase once apps are stable in cloud. This reduces risk — if something goes wrong, it’s easier to rollback a small piece.\par
+- **Data Transfer:** Plan how to migrate data with minimal downtime. Options include snapshot and restore in cloud, live replication (set up the cloud DB as a replica of on-prem, then flip it to primary), or syncing file storage ahead of cutover. You might do a trial run, migrate a recent backup to cloud, point a staging environment to it, see if everything works.\par
+- **Testing & Cutover:** Before final switchover, test the cloud setup thoroughly (load tests, integration tests). On cutover day, perhaps do a freeze on on-prem (stop writes), do a final incremental data sync, then switch DNS or endpoints to cloud. Have a rollback plan if the cloud environment faces an unexpected issue, maybe keep the on-prem running in read-only as a backup for a short time until confident. Finally, after successful migration, decommission on-prem resources carefully, ensuring all data is secured or wiped as needed.\par
+\par
+Q22. **CI/CD Pipeline for Frequent Deployments:** *Your team wants to deploy updates daily (or even multiple times a day) with zero downtime. Design a CI/CD pipeline and deployment strategy to achieve this.*\par
+\par
+A:\par
+\par
+- **Automated Pipeline:** Set up a pipeline that triggers on code pushes. It should include stages for compiling/building, running unit and integration tests, and packaging the application (container image or artifact). Only if tests pass does it progress to deployment. This ensures quality is maintained even with rapid releases.\par
+- **Blue-Green Deployment:** Have two production environments (blue and green). Deploy the new version to the idle one (say green, while blue is live). Run health checks and maybe some synthetic tests. If all good, switch traffic to the new version (flip load balancer or DNS). This provides zero downtime and an easy rollback (flip back to blue) if something goes wrong with the new deployment.\par
+- **Canary Releases:** For very frequent deployments, you might automate canarying: deploy the new version to a small percentage (maybe 5% of users) by running it on a subset of servers. Monitor metrics (error rates, latency). If all looks normal after a certain time, ramp up to 100%. If not, automatically rollback. This limits blast radius of any bad release.\par
+- **Infrastructure as Code & Consistency:** Manage your environments with infrastructure-as-code (Dockerfiles, Kubernetes manifests, Terraform, etc.) so that the CI can spin up test environments that mimic prod. Use feature flags to decouple feature release from deploy, you can deploy code with a feature off, then turn it on for users once the code is verified in production. This helps when deploying frequently; you don’t have to coordinate deploys with exact feature launch timing.\par
+\par
+Q23. **Serverless vs Containers for an API:** *You need to implement a new web API. Discuss whether you would use a serverless function (FaaS) or a container-based microservice, and the implications of each choice.*\par
+\par
+A:\par
+\par
+- **Serverless (FaaS) Pros:** Very easy to deploy and scale, each request can spawn a new function instance as needed, and you don’t manage servers. It’s cost-effective if requests are intermittent (you pay per execution). Also, scaling is automatic up to limits, and no idle cost when unused.\par
+- **Serverless Cons:** Cold start latency can be an issue, the first request after inactivity might be slow while the platform initializes a container for your function. There are also execution time limits (e.g., 15 minutes max). If your API might run long computations or maintain long connections (like WebSockets), FaaS might not be suitable.\par
+- **Containers Pros:** With a container (on ECS/Kubernetes/etc.), you have a long-running service. Good for steady traffic or when you need more control over runtime environment (custom libraries, specific OS tweaks). No inherent execution time limit. You can also handle complex protocols easier (like maintaining connections).\par
+- **Operational Trade-off:** Containers require managing the server or cluster (or using a managed Kubernetes). That’s more operational work than serverless, which is almost zero-admin. On the other hand, with containers you have more predictable performance (no cold starts) and potentially lower cost if usage is high and constant (because serverless per-request costs could sum up higher). In summary, use serverless for quick, scalable, event-driven tasks or prototypes; use a container service if you need full control, long-lived processes, or if you’ve already got infrastructure to manage it efficiently.\par
+\par
+Q24. **IoT Edge vs Cloud Computing:** *You are designing a system for an IoT platform with thousands of sensors. Some data needs immediate reaction, and some can be processed later. How do you split responsibilities between edge devices and the cloud?*\par
+\par
+A:\par
+\par
+- **Edge Processing:** Perform critical, low-latency computations on the edge (on the device or a local gateway). For example, if a sensor detects a dangerous condition (machine overheating), the device/gateway itself can trigger an immediate response (shut it down or alarm) without waiting for the cloud. This ensures real-time response even if connectivity is slow or down.\par
+- **Data Filtering:** The edge can preprocess or filter data, sending only summaries or exceptions to the cloud. For instance, a camera might run an ML model locally to detect whether motion is present, and only send event data or images to the cloud when something significant is detected. This reduces bandwidth usage and cloud processing costs.\par
+- **Cloud Processing:** Use the cloud for heavy aggregations, long-term storage, and non-real-time analytics. The cloud can gather data from all devices, combine it, run machine learning on large datasets (like finding trends across all sensors), and provide a centralized control dashboard.\par
+- **Resilience and Sync:** Design the system to handle intermittent connectivity. Edge devices should queue data when offline and sync with the cloud when back online. Also, cloud should send configuration updates to devices (like new firmware or rules) which the devices apply at the edge. Security is key here: both edge and cloud need mutual authentication so that data and commands are trusted.\par
+\par
+Q25. **Real-Time Recommendation System:** *Design a system that provides real-time product recommendations on an e-commerce site (i.e., suggestions update based on user behavior). What architecture would you use?*\par
+\par
+A:\par
+\par
+- **Streaming Events & Processing:** Capture user events (views, clicks, purchases) as they happen and send them through a streaming pipeline (e.g., Kafka). Use stream processing (Spark Streaming, Flink, or Kafka Streams) to update recommendation data in real-time. For example, if a user views a product, update their “recently viewed” vector immediately for use in recommendations.\par
+- **Recommendation Engine:** There could be an online component (for quick lookups) and an offline component. For instance, precompute daily or hourly top trending or personalized models in batch (offline job) for a baseline. Then use the online stream to refine or adjust these results (like boosting items similar to what the user just interacted with). This hybrid ensures a balance between freshness and robust modeling.\par
+- **Fast Data Store:** Use a low-latency store or cache to serve recommendations. This might hold user embedding vectors, item similarity graphs, or recent event data. At request time (page load), the system fetches the relevant data (user profile, recent interactions) and computes the recommendation list quickly (possibly calling an ML model or a nearest-neighbor search in memory).\par
+- **Feedback Loop & Metrics:** Continuously collect which recommendations led to clicks or purchases to improve the model. Track metrics like click-through-rate of recommendations, and have a fallback if the real-time system fails (e.g., default to a cache of popular items or a last known good recommendation list rather than showing nothing).\par
+\par
+Q26. **Low-Latency ML Model Serving:** *You need to serve an ML model (say, for image recognition or fraud detection) with high throughput and low latency (e.g., <50ms per request). What considerations go into the design?*\par
+\par
+A:\par
+\par
+- **Model Optimization:** First, ensure the model is optimized for inference: use a smaller, efficient model architecture if possible, or compress it (via quantization or pruning). A large model might be accurate but could be too slow; find a balance that meets latency SLA. Use hardware-optimized libraries or formats (TensorRT, ONNX runtime, etc.) that speed up inference.\par
+- **Scaling & Concurrency:** Host the model on multiple instances to handle throughput. A single process can only handle so many requests at once (especially if using GPU, where you might batch requests together to utilize the GPU efficiently). Determine if you need GPU for speed or if CPU with many replicas is sufficient. Monitor CPU/GPU utilization and latency percentiles to decide scaling policies.\par
+- **Caching Results:** If certain predictions repeat often (maybe the same input appears frequently), caching those can save time. For example, in fraud detection, if the same user transaction pattern is checked multiple times, cache the result for a short period. However, for many ML services, inputs are unique, so caching might not be broadly applicable.\par
+- **Deployment Pipeline:** When updating the model, design a strategy to swap models without downtime. You might load the new model on new instances while keeping old ones serving, then switch traffic. Also consider A/B testing new model versions by splitting traffic, to ensure the new one doesn’t regress on latency or accuracy. Operationally, include monitoring for both latency and the model’s outputs (to catch if something goes wrong like a model that suddenly outputs errors or nonsense due to a bug).\par
+\par
+Q27. **Continuous Model Retraining Pipeline:** *Your ML model’s accuracy degrades if the data is not up to date. How would you design a system to continuously retrain and deploy an updated model (e.g., weekly or daily)?*\par
+\par
+A:\par
+\par
+- **Data Pipeline for Training:** Automate data collection and preprocessing. For example, gather the last week’s worth of new data and combine with historical data as needed. Use scheduled workflows (cron job or pipeline orchestrator like Airflow) to extract features and prepare training data. Ensure data is labeled (either via user feedback or offline labeling) and stored in a way that the training job can access.\par
+- **Retraining & Validation:** Spin up training jobs (possibly on specialized hardware like GPUs) on a schedule or when enough new data arrives. After training, run the model through validation tests, not just offline metrics (accuracy, etc.) but also sanity checks (did any metric worsen significantly? Is the output distribution stable?). Only proceed if the model passes these tests, to avoid deploying a bad model.\par
+- **Model Registry & Deployment:** Use a model registry to version your models. When a new model is validated, save it with a version and deploy it to production in a controlled way. Deployment can be automated: for instance, the CI/CD pipeline picks up the new model artifact, deploys it behind an endpoint. Use a canary approach — send a small percentage of real traffic to the new model (shadow mode or parallel run) to ensure it performs well under production conditions.\par
+- **Feedback Loop:** Once fully deployed, continue monitoring the model’s performance (error rates, accuracy on recent data if you can measure it, etc.). Also monitor for data drift — if the input data characteristics change, you might need to retrain more frequently or even consider online learning techniques. This continuous loop ensures the model stays relevant as the world (and data) changes.\par
+\par
+Q28. **A/B Testing for ML Model Updates:** *When rolling out a new machine learning model (say a new recommendation algorithm), how can you compare it against the current model in production to ensure it’s better before fully switching over?*\par
+\par
+A:\par
+\par
+- **Split Traffic:** Implement a routing mechanism to send a percentage of live user requests to the new model while the rest go to the current model. For example, 10% of users (or sessions) are randomly assigned to the new model (Variant B) while 90% continue with the old model (Control A). This should be done in a way that each user stays consistent with one model to have a cohesive experience.\par
+- **Define Success Metrics:** Determine what metrics matter (click-through rate, conversion, error rate, revenue per user, etc.). The A/B test should be designed to measure these metrics for both groups. Also track technical metrics (latency, resource usage) in case the new model is more resource-hungry or slower, which might affect user experience indirectly.\par
+- **Statistical Significance:** Run the test for long enough (or until enough samples) to reach statistical significance on the key metrics. Use hypothesis testing to ensure any observed differences are real and not due to chance. For example, you might require 95% confidence that the new model’s conversion rate is higher before rollout.\par
+- **Rollout or Rollback:** If the new model shows clear improvement (or at least no regressions) and no glaring issues, roll it out to 100% of traffic. If it underperforms or has problems, roll it back (everyone goes back to the old model) and analyze results to identify issues. A/B testing adds some overhead, but it de-risks model releases by validating on real users gradually.\par
+\par
+Q29. **Large-Scale Image Processing System (ML-based):** *Design a system to perform image analysis (e.g., content moderation or tagging) on millions of user-uploaded images daily.*\par
+\par
+A:\par
+\par
+- **Pipeline Architecture:** Use an asynchronous pipeline. When an image is uploaded, it’s first stored (e.g., in cloud storage) and a message is placed on a queue with the image reference. A fleet of processing workers (with ML models loaded, possibly using GPUs) pulls tasks from the queue and processes images one by one. This decouples upload from processing so users aren’t stuck waiting.\par
+- **Parallel Processing & Throughput:** Scale the number of worker instances based on throughput needs. If using cloud, you could auto-scale instances based on queue length. Ensure the ML model is optimized (maybe batch process images if GPU utilization is low, or run multiple threads on CPU if lightweight). If processing is super heavy (like complex neural nets), consider using specialized services (AWS Rekognition, etc., or a cluster of GPU machines).\par
+- **Result Handling:** After analysis, store the results (tags, NSFW flags, etc.) in a database or search index. The results might also trigger further actions (e.g., if content is disallowed, send it for human review or reject it). Make sure to handle errors, if a worker fails to process an image (timeout or crash), the job should be retried or moved to a dead-letter queue with an alert for manual investigation.\par
+- **Cost Considerations:** Processing millions of images is expensive. To optimize cost, consider caching results for duplicate images (if that can happen) so you don’t reprocess the same content. Also, perhaps tier your processing: a quick lightweight model to flag obvious cases, then a heavier model or human review only for borderline cases. This way you don’t spend GPU cycles on every single image unnecessarily.\par
+\par
+Q30. **Feature Store for ML:** *You have many data science teams computing features for machine learning. How would you design a feature store to centrally manage and serve features for both training and inference?*\par
+\par
+A:\par
+\par
+- **Central Repository:** Establish a feature store service where teams register their features. Each feature has a name, definition (how it’s computed), data schema, and backfills for historical values. The store acts as a single source of truth so that a feature is computed consistently for training and serving.\par
+- **Online and Offline Store:** Have a dual storage approach. Offline store (could be a data lake or warehouse) holds feature values for large historical datasets used in model training. The online store (a low-latency DB or cache) holds the latest feature values for each entity (user, product, etc.) for quick access during model serving. For example, a user’s last 7 days activity count might be updated daily in both stores, but the online store has the current value ready for a live prediction request.\par
+- **Consistency & Backfilling:** When a feature logic updates or a new feature is added, support backfilling historical data so models can be trained on it. At the same time, update the online store calculation going forward. Use pipelines that recompute features periodically or in real-time (depending on feature freshness requirements). For real-time features, maybe integrate with streaming data to update the store continuously (e.g., count of clicks in the last 1 hour rolling window).\par
+- **Discoverability and Reuse:** Provide a catalog or API where data scientists can search for existing features. Encourage reuse to avoid duplication (why have 5 versions of “user age bucket” computed by different people?). Also manage access control, some features might contain sensitive data and should only be available to certain teams or purposes. Operationally, also monitor freshness (when was each feature last updated) to catch if any pipeline is stale.\par
+\par
+File name: Pasted markdown (2).md\par
+Language:\par
+[Part 1](https://medium.com/thesystemdesign/50-scenario-based-system-design-questions-for-senior-developer-interviews-part-1-5-667c85cf32b1) was the warm-up: sync conflicts, bad networks, mobile stuff. Part 2 is where things break and you’re the one holding the pager.\par
+\par
+We’re past the surface level now. No more “put a cache in front of it” or “use Kafka and scale horizontally.” These questions are open-ended in a way that makes people uncomfortable, which is exactly the point. They’re closer to what you’re actually reasoning about at 2 a.m. with a PagerDuty alert going off.\par
+\par
+*Hitting the Medium paywall?* **This [link](https://medium.com/thesystemdesign/50-scenario-based-system-design-questions-for-senior-developer-interviews-part-2-5-4e7e3b845f10?sk=3e78d22e2e28fddf6c92481be9d97fb2)** *gets you past it.*\par
+\par
+What candidates are getting asked lately, especially in L5+ loops:\par
+\par
+- How do you stop a priority tenant’s jobs from getting starved in a shared queue?\par
+- How do you shard a database that has a handful of brutally hot keys?\par
+- Your image pipeline is running 40 minutes behind. Your SLA hasn’t moved. Now what?\par
+\par
+You don’t answer these by drawing a familiar diagram. They want to see judgment, awareness of context, and whether you can hold two bad options in your head and pick one on purpose.\par
+\par
+Here are the next ten.\par
+\par
+## Q11. Designing a real-time chat backend\par
+\par
+**Build the backend for something like WhatsApp or Slack. What are the pieces, and where are the trade-offs?**\par
+\par
+Persistent connections, obviously. Each client holds a WebSocket so the server can push a message the moment it arrives instead of waiting for the next poll. That part isn’t interesting. The interesting parts are ordering, delivery, and what happens when someone’s phone has been off for a week.\par
+\par
+**Ordering.** Client timestamps lie. Phones have wrong clocks, and messages arrive out of order over unreliable networks anyway. Assign a sequence number server-side, per conversation, and let clients sort on that. This gets harder if you shard conversations across servers, which is one reason sharding by conversation ID rather than by user is usually the right call.\par
+\par
+**Delivery.** Assume at-least-once. If you don’t get an ack, resend. That means duplicates, so every message carries a client-generated UUID and the receiving side drops anything it’s already seen. Exactly-once delivery over a network is a fantasy people waste a lot of time chasing.\par
+\par
+**Scaling.** Shard users or rooms across chat servers so no single box owns everything. Then you need a pub/sub layer (Redis pub/sub for smaller setups, Kafka or NATS when you outgrow it) so a message sent on server A reaches a subscriber connected to server C. The connection layer and the message routing layer are separate concerns and it helps to talk about them separately.\par
+\par
+**Offline and history.** Undelivered messages go to durable storage keyed by recipient. When the client reconnects, it sends its last known sequence number and you ship the delta. Don’t sync the full history by default. Pull the last 50 or 100 messages per conversation and page backward on demand, or you’ll spend a fortune on bandwidth so people can scroll to a conversation from 2019 they’ll never open.\par
+\par
+## Q12. Fan-out to millions\par
+\par
+**One event, like a celebrity posting or a system-wide alert, needs to notify everybody. How do you build that?**\par
+\par
+Nothing about this happens synchronously. The event goes on a queue, and a pool of consumers each takes a slice of the recipient list. That’s the whole shape of it. The details are where you earn your money.\par
+\par
+**Batch and throttle.** Every downstream provider has limits. SES, SendGrid, FCM, APNs, all of them will throttle you or flag you as a spam source if you open the floodgates. Send in batches, and rate-limit your own workers below the provider ceiling rather than discovering the ceiling by hitting it. Batching also amortizes connection cost, which matters more than you’d think at volume.\par
+\par
+**Prioritize.** Not all notifications are equal. A password reset and a “someone liked your photo” should not share a queue. Use separate queues by priority so a marketing blast can’t delay a security alert by 20 minutes. When the system is under load, the low-priority queue is what you let back up.\par
+\par
+**Handle failure visibly.** Retry transient errors with backoff. Send permanent failures (dead tokens, bounced addresses) to a dead-letter queue and actually process it, cleaning up bad tokens as you go. Then instrument the send rate and success rate, because notification failures are silent by nature. Nobody files a ticket saying “I did not receive a notification I didn’t know about.” You find out three weeks later when someone asks why engagement dropped.\par
+\par
+## Q13. Distributed job scheduler\par
+\par
+**Design something that runs background jobs on a schedule across a cluster: emails, reports, cleanup tasks.**\par
+\par
+You need one authoritative store for what’s scheduled and when it next runs. A database table works fine for most scales. Workers query for jobs whose next run time has passed and claim them.\par
+\par
+The claiming is the whole problem. Two workers grabbing the same job means two emails, two invoices, two charges. Two ways to handle it:\par
+\par
+- **Leader election.** One node wins a lease (etcd, ZooKeeper, or a Postgres advisory lock if you don’t want another dependency) and hands out work. Simple to reason about, single point of coordination.\par
+- **Partitioning.** Hash the job ID and assign each worker a range. No coordination needed at steady state, but rebalancing when a worker dies is its own puzzle.\par
+\par
+Either way, jobs must be idempotent. Clock skew, failovers, and expired leases will eventually cause double execution no matter how careful your coordination is. Design for it instead of pretending it won’t happen. A status column with a state machine (pending, running, done) plus a conditional update is usually enough.\par
+\par
+Two operational things people skip and regret. Monitoring: you need visibility into next run time, last outcome, and duration, because a scheduled job that quietly stops running is invisible until the backups you thought you had turn out not to exist. And time zones: store everything in UTC, convert only at display time. If users can schedule in local time, be very deliberate about what happens during a DST transition, since 2:30 a.m. either doesn’t exist or happens twice depending on the direction.\par
+\par
+## Q14. Log ingestion at high volume\par
+\par
+**Your service produces an enormous number of log events. Design collection, storage, and querying.**\par
+\par
+Log agents on each host ship to a central pipeline, usually Kafka. The important property is that your application never blocks on logging. Write to a local buffer, let the agent do the shipping, and if the pipeline is down the app keeps serving traffic.\par
+\par
+From Kafka, fan out to different consumers with different jobs. One indexes into Elasticsearch or OpenSearch for interactive search. Another writes raw events to object storage in Parquet for cheap long-term retention and analytics. These have completely different cost profiles and you shouldn’t force one system to do both.\par
+\par
+Partition indices by time, usually daily. This makes queries bounded, lets you roll old indices to cheaper storage, and makes deletion a matter of dropping an index instead of running a delete query across a billion documents.\par
+\par
+Now the part that actually gets asked: what happens when volume spikes past what you can process. Kafka absorbs a lot, which buys you time to scale consumers. But if the spike is sustained you need a policy decided ahead of time, not during the incident. Usually that means sampling or dropping debug and info logs while preserving warn and error, since a wave of debug logging is often a symptom of the incident rather than useful signal. Say this out loud in an interview. Being willing to lose data on purpose to keep the system up is a senior instinct.\par
+\par
+## Q15. Payment processing without double charges\par
+\par
+**Design payment handling for e-commerce that stays correct when things fail.**\par
+\par
+Everything hangs off the idempotency key. The client generates one per checkout attempt and sends it with the request. Your gateway and your own service both key on it, so a retried request returns the original result instead of charging again. Stripe and most modern gateways support this natively and you should use it rather than inventing your own.\par
+\par
+Break the flow into explicit steps: authorize, capture, update order, send receipt. Each step records its outcome durably before moving on. If you’re spread across services, coordinate with a saga: when the charge succeeds but the order write fails, you need a compensating action, whether that’s an automatic refund or flagging it for a human. Use a transactional outbox so the “I took money” event survives the process dying immediately after taking the money.\par
+\par
+Timeouts are the nastiest case. A charge request that times out tells you nothing. It may have succeeded. Never blind-retry it. Query the gateway for the transaction status using your idempotency key, or wait for the webhook, then decide. Getting this wrong is how you end up on Twitter.\par
+\par
+On the security side, keep card data out of your systems entirely. Use hosted fields or the gateway’s SDK so raw PANs never touch your servers, store a token and the last four digits, and make sure your logging can’t accidentally capture a card number in a request dump. Keep an audit trail of every state transition, because finance will ask you to reconcile daily totals and you’ll want a record more precise than “the gateway says so.”\par
+\par
+## Q16. Building search\par
+\par
+**Users need to search posts, documents, or products. How do you build it?**\par
+\par
+Elasticsearch or OpenSearch for most cases. Postgres full-text search is genuinely fine up to a surprisingly large point, and starting there saves you an entire piece of infrastructure. Know that answer too, because “we don’t need Elasticsearch yet” is sometimes the correct one.\par
+\par
+The index holds a denormalized snapshot: title, description, tags, whatever you filter and rank on. Keeping it in sync with the primary database is the hard part. Change data capture (Debezium reading the WAL, or an outbox table drained by a worker) beats dual writes, because dual writes fail halfway and leave you with an index that quietly disagrees with your database. Plan for a full reindex too. You will change your mapping and need to rebuild, so make that a routine operation rather than an emergency.\par
+\par
+Some staleness is fine. Search results being a few seconds behind is almost never a real problem, and pretending you need synchronous index updates makes writes slow for no benefit.\par
+\par
+At query time, search returns IDs and scores. Whether you hydrate from the index or from your primary database depends on how much you trust the index’s freshness for the fields you display. Prices and stock levels are worth reading from the source of truth.\par
+\par
+Relevance is where search projects live or die, and it’s iterative. Boost title matches over body matches. Handle typos with fuzzy matching. Add n-grams if partial matches matter for your domain. Then log what people search, what they click, and especially what returns nothing, because your zero-result queries are the clearest list of what your search is bad at.\par
+\par
+## Q17. Going multi-region\par
+\par
+**Global user base. How do you deploy for low latency everywhere?**\par
+\par
+Full stacks in each region, with GeoDNS or an anycast load balancer routing users to the nearest one. Straightforward until you get to data, which is the entire question.\par
+\par
+Three broad approaches:\par
+\par
+- **Home region per user.** Their data lives in one place, and they’re routed there. Clean consistency story, and it maps well onto data residency requirements like GDPR. Falls apart for genuinely global features like a shared feed or leaderboard.\par
+- **Global reads, single-region writes.** Read replicas everywhere, writes go to a primary. Reads are fast for everyone, writes cost a cross-region round trip. Good for read-heavy workloads, which is most of them.\par
+- **Multi-master.** Writes are fast everywhere and you pay for it in conflict resolution. Spanner or CockroachDB will handle this for you at a latency and dollar cost. Rolling your own conflict resolution is a project, not a design decision.\par
+\par
+The trade-off to name explicitly is that synchronous global replication means every write waits on the slowest region, and physics puts a floor on that. Most systems accept eventual consistency and design the UX around it: show the user their own write immediately from local state, let it propagate in the background.\par
+\par
+The upside of all this is failure isolation. Active-active means you shift traffic away from a dead region and absorb the load elsewhere, which requires each region to have headroom you’re paying for. Active-passive is cheaper and slower to recover. Whichever you pick, run the failover regularly, because an untested failover is a hypothesis, not a plan.\par
+\par
+## Q18. Spiky traffic without spiky bills\par
+\par
+**Traffic is heavy during the day, near zero at night, with occasional big surges. How do you avoid paying for peak capacity 24/7?**\par
+\par
+Autoscaling is the obvious answer, and the obvious answer is incomplete. Scale on the metric that reflects your actual bottleneck, which is often queue depth or request latency rather than CPU. And know that reactive scaling is slow: by the time you’ve noticed load, provisioned an instance, and passed health checks, you may be several minutes into the spike. Keep enough warm headroom to cover that gap.\par
+\par
+Serverless suits this shape of load well. Scales to zero, scales out fast, and you pay per invocation. The catch is cold starts, and the fact that per-request cost is higher, so a workload that’s spiky but has a high floor can end up more expensive than reserved instances. Run the math for your actual numbers instead of assuming.\par
+\par
+For spikes too sharp for any scaling to catch, put a queue in front. Accept the request, return a 202, process at a sustainable rate. Users wait a bit longer, and you don’t fall over. This only works if the operation can be async, but far more things can be async than people initially think.\par
+\par
+And when you know a spike is coming, scale up beforehand. A scheduled scaling rule ahead of a 5 p.m. campaign is much more reliable than hoping autoscaling keeps up. Reactive scaling and queues are your safety net for the surges nobody predicted.\par
+\par
+## Q19. Disaster recovery\par
+\par
+**Business-critical app with strict uptime requirements. What’s the DR plan?**\par
+\par
+Start with the two numbers, because everything else is downstream of them. RPO is how much data you can afford to lose. RTO is how long you can be down. A team that says “zero and zero” hasn’t priced it. Get real numbers from the business and design to them.\par
+\par
+Backups go to a different region, and continuous replication to a standby keeps RPO low. Test the restores. An untested backup is a folder of files you hope are useful. Restore drills catch the corrupted backup, the missing encryption key, and the eight-hour restore time you didn’t budget for.\par
+\par
+Then pick your standby posture. Hot standby means a second environment running now, taking traffic within minutes, costing real money continuously. Warm means scaled-down infrastructure you scale up on failover. Cold means restoring from backup, which is cheap and might take a full day. This is purely a cost-versus-RTO decision and there’s no clever answer.\par
+\par
+Automate the failover itself. Health checks, low DNS TTLs, and a runbook that ideally isn’t a human editing config under pressure. Make sure the app picks up new database endpoints without a rebuild.\par
+\par
+Finally, plan for partial failures, which are far more common than losing a region. One database, one availability zone, one dependency. Full regional failover is a big hammer, and reaching for it when only the cache layer is down usually makes things worse.\par
+\par
+## Q20. Managed services versus self-hosting\par
+\par
+**You need a datastore and a queue. RDS and SQS, or run Postgres and Kafka yourself?**\par
+\par
+Default to managed, and know exactly why you’d deviate.\par
+\par
+Managed services buy back the work nobody wants: patching, backups, failover, replication setup, version upgrades. For a team without a dedicated infrastructure person, that’s not a convenience, it’s the difference between shipping features and becoming a part-time DBA. You pay a premium and you accept some lock-in, especially with the more proprietary offerings.\par
+\par
+Self-hosting makes sense at scale, where the managed premium turns into a serious line item, or when you need configuration the managed version won’t expose. Running Kafka yourself is very doable if you have people who know Kafka. If you don’t, you’ll learn during your first partition leader election problem, at 3 a.m., in production.\par
+\par
+The honest path for most teams is managed first, migrate later if the economics change. Start on RDS, and if you eventually outgrow it, you’ll be migrating with real usage data and a much better sense of what you actually need. Just don’t pretend that migration is free. Moving a production database is a project with a planning doc and a rollback plan.\par
+\par
+The one thing worth checking early is whether the managed version has a limit you’ll hit. Message size caps, connection limits, missing extensions, throughput ceilings. Finding out about those after you’ve built on top is a much worse day than reading the limits page now.\par
+\par
+That’s twenty. Part 3 gets into caching strategy, cache invalidation, and the failure modes that show up when your cache and your database disagree.\par
+\par
+File name: Pasted markdown.md\par
+Language:\par
+Let’s be honest about the classic system design questions. “Design Twitter.” “Build YouTube.” “Scale Stripe.” You’ve never worked on those systems. Neither has the person interviewing you. And unless you’re at one of maybe fifteen companies on earth, you never will.\par
+\par
+System design prep has become its own cottage industry. Everyone knows the moves by now: add a load balancer, sprinkle in some caching, say the words “eventual consistency,” nod confidently. Companies figured this out. The script stopped working.\par
+\par
+**Medium paywall got you? This [link](https://medium.com/@TheAbstractEngineer/667c85cf32b1?sk=b251e9942ff3c3bbd1cf8e3cadce6574) lets you read it free.**\par
+\par
+What I keep hearing from friends interviewing lately, particularly in Karat screens and senior loops, is that the questions have shifted toward problems the team is actually fighting with that quarter. Things like:\par
+\par
+- How would you make YouTube better at catching copyrighted uploads?\par
+- How do you keep millions of devices in sync when most of them are offline most of the time?\par
+- How do you push notifications to 100 million users without turning into spam?\par
+\par
+None of these draw nicely on a whiteboard. They’re messy. They come down to trade-offs, judgment calls, and accepting that no design is correct, only appropriate for the constraints you have right now.\par
+\par
+So I wrote up 50 of them. Real scenarios, the kind where you have to reason like someone shipping to production on Thursday instead of a student taking a test.\par
+\par
+This is Part 1, covering the first ten. Answers are short and practical, closer to what you’d actually say in the room.\par
+\par
+## Q1. Offline-first mobile sync\par
+\par
+**Your mobile app has to work with no connection and sync up later. How do you design the sync mechanism and handle conflicts?**\par
+\par
+Start with local storage that the app treats as the source of truth. Room on Android, Core Data on iOS, or plain SQLite. Every user action writes locally first and gets appended to a queue (WorkManager, or an RxJava queue if that’s your stack). The UI never waits on the network, which is the whole point.\par
+\par
+When the connection comes back, flush the queue in batches, ordered by timestamp. The hard part is what happens when the same record got edited on two devices while both were dark. Your options, roughly in order of effort:\par
+\par
+- Last write wins, based on timestamp. Cheap, and fine for things like a settings toggle.\par
+- Prompt the user to merge. Annoying, but sometimes the only honest answer for documents or notes.\par
+- CRDTs or version vectors. Real work, but they let you merge automatically without lying to the user about what happened.\par
+\par
+Pick based on how much the data actually matters. Losing someone’s collaborative doc edits is a very different failure than losing a “dark mode: on” toggle.\par
+\par
+Two things that will bite you if you skip them. First, make every sync operation idempotent, because retries are guaranteed and duplicate writes are ugly. Second, use a sync cursor or token so the client pulls only the delta instead of re-downloading the world every time it reconnects. Add exponential backoff on retries so a flapping connection doesn’t hammer your API.\par
+\par
+**Short version:** write locally, sync in batches, and be deliberate about conflicts instead of hoping they don’t happen.\par
+\par
+## Q2. Push notifications at scale\par
+\par
+**Design a system that sends push notifications to millions of users in real time, like a breaking news alert.**\par
+\par
+You don’t talk to devices. APNs handles iOS, FCM handles Android, and your job is managing device tokens and living inside their constraints: payload size caps, rate limits, token expiry, and cleaning up tokens that come back invalid.\par
+\par
+Fan-out is where this gets interesting. Ten million sends can’t come from one box. Put the send job on a queue and let a pool of workers chew through it in parallel, partitioned by token or user ID. Scale the worker pool, not the single sender.\par
+\par
+Delivery is not guaranteed and you should design like you believe that. Devices are off, out of coverage, or the OS decided to throttle. Retry a few times, then stop. If a phone hasn’t checked in for four days, that breaking news alert is no longer breaking, and delivering it is arguably worse than dropping it.\par
+\par
+Then there’s the part people forget in interviews: the human on the other end. Honor opt-outs, quiet hours, and per-category preferences. Coalesce related alerts instead of firing five in a row. A notification system that technically works but gets your app muted has failed at its actual job.\par
+\par
+## Q3. Real-time location tracking for ride-hailing\par
+\par
+**You’re building the location layer for something like Uber. How do you get GPS updates to driver and rider apps efficiently?**\par
+\par
+Use a persistent connection. WebSockets or MQTT, with MQTT being the better fit if you care about battery and small payloads. Polling every second for a moving car is wasteful in both directions.\par
+\par
+The update frequency is a real trade-off and interviewers usually want to hear you name it. One update per second looks great on the map and eats battery. Every three to five seconds is usually plenty, and you can do better by only sending when the driver has moved past some distance threshold. A car sitting at a red light doesn’t need to report anything.\par
+\par
+On the backend, partition by geography or by trip so each server owns a slice of active rides. Model it as pub/sub: the rider subscribes to their driver’s channel, and location updates go only to subscribers. Nobody broadcasts to everybody.\par
+\par
+Then handle the ugly reality of GPS. Signal drops in tunnels and parking garages. Coordinates jump around near tall buildings. The client can smooth this by interpolating along the last known heading for a few seconds, then showing “signal lost” if nothing arrives. And when a client reconnects, send it the current position immediately rather than making it wait for the next scheduled update.\par
+\par
+## Q4. Uploads that survive bad networks\par
+\par
+**Your app uploads photos and videos. In regions with weak connectivity, uploads keep failing. How do you fix the experience?**\par
+\par
+Chunk the file and upload the pieces. When the connection dies at 80%, you retry one chunk, not 40 megabytes. Every major storage API supports resumable multipart uploads, so you rarely have to build this from scratch.\par
+\par
+Run the upload in a background service so it survives the user switching apps or locking the phone. That service watches connectivity and pauses and resumes on its own. Nobody should have to sit staring at a progress bar to keep their vacation photos from disappearing.\par
+\par
+Compress on-device before sending. Resizing a 12 megapixel photo down to something reasonable can cut the payload by an order of magnitude, and most users won’t see the difference. If your app is photography-focused, make it a setting instead of a decision you make for them: “upload full quality on Wi-Fi only” covers most cases.\par
+\par
+Finally, be honest in the UI. Show real progress. When something fails, say so and give a retry button. If the network is hopeless, queue the upload and tell the user it’ll go out later. Silent failure is the worst possible outcome here, because people assume the photo uploaded and delete it from their camera roll.\par
+\par
+## Q5. Supporting old app versions\par
+\par
+**Your API keeps evolving but plenty of users are still on a build from eight months ago. How do you handle it?**\par
+\par
+The straightforward path is versioned endpoints: /api/v1/..., /api/v2/.... Old clients keep hitting the old routes and nothing breaks. The cost is that you now maintain two code paths, and if you're not disciplined, four.\par
+\par
+The alternative is a compatibility layer at the edge. Read the client version from a header, then shape the response to match what that build expects. New field the old app can’t parse? Strip it or supply a default. This keeps one core codebase but pushes the mess into a translation layer, which has its own way of getting gnarly.\par
+\par
+Either way you need a deprecation policy. Support the last N versions, warn people well before you cut them off, and force the upgrade eventually. Too aggressive and you’re breaking people mid-flight. Too lenient and you’re maintaining code for a build from 2023 that nine people still use.\par
+\par
+And test it. Keep a suite that runs your new backend against payloads from older clients. This is boring work that saves you from a very bad Monday.\par
+\par
+## Q6. When the backend goes down\par
+\par
+**Your backend is temporarily unavailable. What should the app do?**\par
+\par
+Show something. Cache recent data locally (last viewed items, recent messages, the user’s own profile) and serve it with a small banner noting it might be stale. A slightly old screen beats a spinner or a red error page by a wide margin.\par
+\par
+Queue what you can. Let people compose the message, fill out the form, write the review. Store it locally and send it when the server comes back. You’re preserving their work and their momentum instead of throwing it away.\par
+\par
+Say what’s happening in plain language. “Can’t reach the server right now. Some things won’t work.” That’s better than “Error 503” and infinitely better than a screen that just sits there. If they try something that genuinely can’t be queued, tell them why.\par
+\par
+For the features that really can’t go down, consider a fallback. A static config file, a read replica, a cached response served from a CDN. It’s extra machinery and you shouldn’t build it for everything, but for login or a payment status check it can be worth it.\par
+\par
+## Q7. On-device versus cloud processing\par
+\par
+**A feature needs heavy computation, say image recognition or AR. Where does the work happen?**\par
+\par
+On-device wins on latency and availability. No round trip, no dependency on signal, and the data never leaves the phone, which matters a lot if you’re processing faces or documents. The costs are battery drain, a floor on what hardware you can support, and shipping model weights inside your app bundle.\par
+\par
+Server-side wins on capability. You can run a model that would never fit on a phone, upgrade it whenever you want, and keep hardware requirements out of your minimum spec. The costs are network dependency and a per-request compute bill that scales with usage.\par
+\par
+In practice most teams end up somewhere in the middle. Run a small model on-device to filter, crop, or detect that something is even worth processing, then send the reduced payload up for the expensive part. You cut both bandwidth and cloud spend, and the app still feels instant because the first stage is local.\par
+\par
+One factor that quietly decides this for a lot of teams: how often the logic changes. If you’re retraining monthly, server-side means you ship an update and everyone has it. On-device means waiting for app store review, or building a whole model-download-and-swap pipeline. That pipeline is more work than people expect.\par
+\par
+## Q8. Too many network calls\par
+\par
+**Users say the app feels slow, and you find it’s firing off a pile of small requests. What now?**\par
+\par
+Batch. If launching the app triggers five separate calls, build one endpoint that returns all of it. You’re paying for connection setup, TLS handshake, and round-trip latency five times over for no reason. On a 3G connection that’s the difference between 400ms and two seconds.\par
+\par
+Cache aggressively on the client. Config, feature flags, user preferences, category lists. Store them locally and only re-fetch when a version or timestamp says they changed. Most apps re-download the same unchanging JSON on every cold start.\par
+\par
+Prefetch when it’s cheap. After loading a list, pull details for the first few items in the background so tapping through feels instant. Just don’t get greedy and download things nobody looks at, especially on metered connections.\par
+\par
+If the slowness comes from constant back-and-forth rather than a few big calls, the protocol might be the problem. WebSockets or gRPC streams let you push small updates without HTTP overhead on every message. Worth it for chat, live scores, order tracking, anything where updates arrive continuously.\par
+\par
+## Q9. Monolith or microservices\par
+\par
+**New product, small team, scope still fuzzy. One engineer wants microservices on day one. What do you say?**\par
+\par
+Start with the monolith, and be able to explain why without sounding lazy.\par
+\par
+One codebase, one deploy, one place to look when something breaks. Refactoring across module boundaries is a find-and-replace instead of a coordination problem across three repos and two teams. With a small team and requirements that will change three times before launch, that speed is the whole advantage.\par
+\par
+Microservices are genuinely good at what they’re good at: scaling pieces independently, letting teams deploy on their own schedule, isolating failures. But you pay for it up front with service discovery, distributed tracing, network failure handling, versioned contracts between services, and a much harder local dev setup. Splitting a system you don’t understand yet means drawing boundaries in the wrong places, and moving a boundary later is far more painful than moving a module.\par
+\par
+The pragmatic answer is a well-structured monolith with clear internal module boundaries, then extract services when something actually demands it. Usually that’s a component with a wildly different scaling profile, like video transcoding or a search index, or a team that’s grown big enough to need its own deploy cadence. Let the pain tell you where to cut.\par
+\par
+## Q10. Rate limiting a public API\par
+\par
+**You’ve got a public REST API and some clients are hammering it. How do you design rate limiting?**\par
+\par
+Decide the policy first, since the implementation follows from it. Something like 100 requests per minute per API key, with different tiers for free and paid. Key off the API key rather than IP where you can, since IP breaks badly behind corporate NATs and mobile carriers.\par
+\par
+Enforce it at the gateway, before requests reach your application code. Token bucket is the usual choice: each request takes a token, tokens refill at a fixed rate, and an empty bucket means a 429. Bucket size controls how much burst you tolerate, which matters more than people think. A client that fires 20 requests on app launch and then goes quiet isn’t abusing anything, and a bucket with zero headroom punishes them for normal behavior.\par
+\par
+Counters have to be shared across servers. Redis is the standard answer here. If each instance keeps its own count, a client behind a load balancer effectively gets N times the limit, and your rate limiter is decoration.\par
+\par
+Last, make it usable. Document the limits. Return X-RateLimit-Remaining and X-RateLimit-Reset headers so clients can back off on their own instead of guessing. Send a Retry-After on the 429. Developers will build against your limits if you tell them what the limits are, and most abuse turns out to be a badly written retry loop rather than malice.\par
+\par
+\par
+\par
+\par
+\par
+\par
+\par
+\par
+\par
+\par
+\par
+\par
+\par
+\par
+\par
+\par
+\par
+\par
+\par
+\par
+\par
+}\par
